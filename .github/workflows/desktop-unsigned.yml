@@ -25,6 +25,9 @@ concurrency:
 
 env:
   DSH_TELEMETRY_DISABLED: '1'
+  # 兜底：GNU tar 会把 Windows 盘符的冒号当成「远程主机:路径」分隔符，报 "Cannot connect to D: resolve failed"。
+  # GNU tar 遵守 TAR_OPTIONS，bsdtar 会忽略它，所以此行对两种 tar 都安全。
+  TAR_OPTIONS: '--force-local'
   ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
   ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
 
@@ -53,6 +56,48 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: 修补上游 tar 缺陷（prepare-package-set.ts 漏用 basename+cwd）
+        shell: bash
+        run: |
+          cat > patch-tar.mjs <<'PATCH_EOF'
+          import { readFileSync, writeFileSync } from 'node:fs'
+
+          const file = 'apps/desktop/scripts/prepare-package-set.ts'
+          let src = readFileSync(file, 'utf8')
+
+          const FIXED = "capture('tar', ['-xOzf', basename(tarball), 'package/package.json'], { cwd: dirname(tarball) })"
+          if (src.includes(FIXED)) {
+            console.log('[skip] already patched')
+            process.exit(0)
+          }
+
+          const OLD_CALL = "capture('tar', ['-xOzf', tarball, 'package/package.json'])"
+          if (!src.includes(OLD_CALL)) {
+            console.error('[FAIL] target tar call not found in ' + file)
+            process.exit(1)
+          }
+          src = src.replace(OLD_CALL, FIXED)
+
+          const OLD_IMPORT = "import { basename, join, resolve } from 'node:path'"
+          const NEW_IMPORT = "import { basename, dirname, join, resolve } from 'node:path'"
+          if (src.includes(OLD_IMPORT)) {
+            src = src.replace(OLD_IMPORT, NEW_IMPORT)
+          } else if (!/^import \{[^}]*\bdirname\b[^}]*\} from 'node:path'$/m.test(src)) {
+            console.error('[FAIL] cannot add dirname to the node:path import')
+            process.exit(1)
+          }
+
+          if (!src.includes(FIXED)) {
+            console.error('[FAIL] call replacement did not stick')
+            process.exit(1)
+          }
+          writeFileSync(file, src)
+          console.log('[ok] patched ' + file)
+          PATCH_EOF
+          node patch-tar.mjs
+          rm -f patch-tar.mjs
+          grep -n "from 'node:path'\|capture('tar'" apps/desktop/scripts/prepare-package-set.ts
+
       - name: 打印版本与工具链
         shell: bash
         run: |
@@ -61,6 +106,11 @@ jobs:
           git --version
           node -e "console.log('desktop product version =', require('./apps/desktop/package.json').version)"
           node -e "const fs=require('fs');const v=(process.env['ProgramFiles(x86)']||'')+'/Microsoft Visual Studio/Installer/vswhere.exe';console.log('vswhere =',v,'| exists =',fs.existsSync(v))"
+          echo '--- tar 身份（用于排查 GNU tar 盘符冒号问题）---'
+          which -a tar
+          tar --version 2>&1 | sed -n 1p
+          if [ -f /c/Windows/System32/tar.exe ]; then /c/Windows/System32/tar.exe --version 2>&1 | sed -n 1p; else echo 'System32 tar.exe: 不存在'; fi
+          echo "TAR_OPTIONS=${TAR_OPTIONS:-<unset>}"
 
       - name: 放宽 pnpm 供应链发布年龄限制（否则全量依赖安装会中途失败）
         shell: bash
