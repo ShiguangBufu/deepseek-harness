@@ -1,0 +1,153 @@
+name: Desktop Windows x64 (unsigned)
+
+# 在 GitHub 网页上手动触发：仓库 → Actions → 左侧选本工作流 → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_kind:
+        description: '产物类型：dir = 免安装绿色目录（推荐，便于与你现有第三方壳并存）；installer = NSIS 安装包（未签名）'
+        type: choice
+        options:
+          - dir
+          - installer
+        default: dir
+      source_ref:
+        description: '源码 ref（留空 = 触发时所在分支；也可填 tag，如 dsh-v0.1.7-rc.2）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-unsigned-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+  ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+  ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+
+jobs:
+  package:
+    name: package win-x64
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.ref }}
+          fetch-depth: 1
+
+      - name: 准备 pnpm（版本取自 packageManager 字段 = 11.7.0）
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: 准备 Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: 打印版本与工具链
+        shell: bash
+        run: |
+          node --version
+          pnpm --version
+          git --version
+          node -e "console.log('desktop product version =', require('./apps/desktop/package.json').version)"
+          node -e "const fs=require('fs');const v=(process.env['ProgramFiles(x86)']||'')+'/Microsoft Visual Studio/Installer/vswhere.exe';console.log('vswhere =',v,'| exists =',fs.existsSync(v))"
+
+      - name: 放宽 pnpm 供应链发布年龄限制（否则全量依赖安装会中途失败）
+        shell: bash
+        run: |
+          if ! grep -q '^minimumReleaseAge:' pnpm-workspace.yaml; then
+            printf '\nminimumReleaseAge: 0\n' >> pnpm-workspace.yaml
+          fi
+          tail -3 pnpm-workspace.yaml
+
+      - name: 写入 apps/desktop/.env.windows（该文件被 .gitignore 忽略，只能在运行时生成）
+        shell: bash
+        run: |
+          printf '%s\n' \
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness' \
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production' \
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://download.deepseek.com' \
+            > apps/desktop/.env.windows
+          echo '--- apps/desktop/.env.windows ---'
+          cat apps/desktop/.env.windows
+
+      - name: 安装依赖
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            echo "::group::pnpm install (attempt ${attempt})"
+            if pnpm install --frozen-lockfile --config.minimumReleaseAge=0; then
+              echo '::endgroup::'
+              exit 0
+            fi
+            echo '::endgroup::'
+            echo "pnpm install attempt ${attempt} failed; retrying"
+            sleep 20
+          done
+          echo 'pnpm install failed twice'
+          exit 1
+
+      - name: 预检（只校验配置与工具链，不出包）
+        shell: bash
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64:unsigned -- --check
+
+      - name: 打包（免安装绿色目录）
+        if: inputs.artifact_kind == 'dir'
+        shell: bash
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64:unsigned -- --dir
+
+      - name: 打包（NSIS 安装包，未签名）
+        if: inputs.artifact_kind == 'installer'
+        shell: bash
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64:unsigned
+
+      - name: 汇总产物
+        if: always()
+        shell: bash
+        run: |
+          ROOT=apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts
+          {
+            echo '## 产物清单'
+            echo
+            echo '```'
+            if [ -d "$ROOT" ]; then
+              find "$ROOT" -maxdepth 2 -printf '%y %10s  %p\n' | head -80
+              echo
+              du -sh "$ROOT"
+            else
+              echo "未生成：$ROOT"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-win-x64-unsigned-${{ inputs.artifact_kind }}
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/**
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
+
+      - name: 上传打包日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-logs-${{ github.run_id }}
+          path: apps/desktop/.desktop-build/packaging-runs/**
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
