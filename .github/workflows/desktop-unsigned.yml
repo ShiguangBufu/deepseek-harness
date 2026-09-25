@@ -28,8 +28,12 @@ env:
   # 兜底：GNU tar 会把 Windows 盘符的冒号当成「远程主机:路径」分隔符，报 "Cannot connect to D: resolve failed"。
   # GNU tar 遵守 TAR_OPTIONS，bsdtar 会忽略它，所以此行对两种 tar 都安全。
   TAR_OPTIONS: '--force-local'
-  ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
-  ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+  # ⚠️ 不要把 ELECTRON_BUILDER_CACHE 指到仓库内（例如 ${{ github.workspace }}/.cache/electron-builder）：
+  # electron-builder 会把 icons@x 工具包解压到该目录，并直接 `node .../icon-tool.js` 调它。
+  # 仓库根 package.json 含 "type": "module"，该 CommonJS 脚本会被当成 ESM 执行，报
+  # "ReferenceError: require is not defined in ES module scope"。
+  # 且只有生成 ICO（NSIS 安装包）时才触发，--dir 绿色目录不会 —— 排查时极易误判。
+  # 因此这里不覆盖，沿用 electron-builder / Electron 的默认缓存位置（%LOCALAPPDATA%，在仓库之外）。
 
 jobs:
   package:
